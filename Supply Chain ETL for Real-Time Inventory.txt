@@ -1,0 +1,299 @@
+import pandas as pd
+import datetime
+import random
+import uuid # For generating unique IDs
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
+
+# Matplotlib and Seaborn for visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# Using SQLite for simplicity. For Snowflake/Redshift, you would use their
+# respective SQLAlchemy dialects and connection strings.
+# Example for PostgreSQL (similar to MySQL in structure):
+# "postgresql://user:password@host:port/database_name"
+DATABASE_URL = "sqlite:///./supply_chain_inventory.db"
+
+# Number of simulated warehouses/sources
+NUM_WAREHOUSES = 3
+# Number of unique SKUs to simulate
+NUM_SKUS = 50
+# Number of days of historical data to simulate
+DAYS_OF_DATA = 30
+
+# Stock thresholds for flagging
+OVERSTOCK_THRESHOLD_MULTIPLIER = 1.5 # If current stock > 1.5 * average historical stock
+UNDERSTOCK_THRESHOLD_ABSOLUTE = 10 # If current stock < 10 units
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the InventoryRecord model
+class InventoryRecord(Base):
+    __tablename__ = "inventory_records"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    sku = Column(String, nullable=False, index=True)
+    warehouse_id = Column(String, nullable=False, index=True)
+    quantity = Column(Integer, nullable=False)
+    # Use UTC for timestamps
+    last_updated = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    product_category = Column(String)
+    is_overstock = Column(Boolean, default=False)
+    is_understock = Column(Boolean, default=False)
+
+    def __repr__(self):
+        return (f"<InventoryRecord(sku='{self.sku}', warehouse='{self.warehouse_id}', "
+                f"qty={self.quantity}, updated='{self.last_updated.strftime('%Y-%m-%d %H:%M')}')>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Simulated Data Extraction ---
+def simulate_warehouse_data(warehouse_id: str, num_skus: int, days_of_data: int):
+    """
+    Simulates extracting raw inventory data from a single warehouse source.
+    Generates daily snapshots of inventory levels for a set of SKUs.
+    """
+    print(f"Simulating data for Warehouse: {warehouse_id}...")
+    inventory_data = []
+    end_date = datetime.datetime.now(datetime.timezone.utc)
+    start_date = end_date - datetime.timedelta(days=days_of_data - 1)
+
+    skus = [f"SKU_{i:04d}" for i in range(num_skus)]
+
+    for sku in skus:
+        current_quantity = random.randint(50, 500) # Initial stock
+        for i in range(days_of_data):
+            current_date = start_date + datetime.timedelta(days=i)
+            # Simulate daily fluctuations in quantity
+            quantity_change = random.randint(-20, 20)
+            current_quantity = max(0, current_quantity + quantity_change) # Quantity can't go below 0
+
+            inventory_data.append({
+                'sku': sku,
+                'warehouse_id': warehouse_id,
+                'quantity': current_quantity,
+                'last_updated': current_date + datetime.timedelta(hours=random.randint(0, 23), minutes=random.randint(0, 59))
+            })
+    df = pd.DataFrame(inventory_data)
+    df['last_updated'] = pd.to_datetime(df['last_updated'])
+    print(f"  Generated {len(df)} records for {warehouse_id}.")
+    return df
+
+# --- Data Transformation ---
+def transform_inventory_data(df_raw_inventory: pd.DataFrame):
+    """
+    Transforms raw inventory data: cleans, deduplicates, enriches, and flags stock status.
+    """
+    print("Starting inventory data transformation...")
+    if df_raw_inventory.empty:
+        print("Raw inventory data is empty, skipping transformation.")
+        return pd.DataFrame()
+
+    df_transformed = df_raw_inventory.copy()
+
+    # 1. Data Cleaning: Ensure quantity is integer, handle potential NaNs (though synthetic data is clean)
+    df_transformed['quantity'] = pd.to_numeric(df_transformed['quantity'], errors='coerce').fillna(0).astype(int)
+
+    # 2. Deduplication: Keep only the latest record for each SKU per warehouse per day
+    # This simulates getting multiple updates in a day, and we want the final state.
+    df_transformed['record_date'] = df_transformed['last_updated'].dt.date
+    df_transformed = df_transformed.sort_values(by='last_updated', ascending=False)
+    df_transformed.drop_duplicates(subset=['sku', 'warehouse_id', 'record_date'], keep='first', inplace=True)
+    df_transformed.drop(columns=['record_date'], inplace=True) # Remove temporary column
+
+    # 3. Data Enrichment: Map product categories based on SKU patterns
+    def get_product_category(sku):
+        if sku.startswith('SKU_00'): return 'Electronics'
+        if sku.startswith('SKU_01'): return 'Apparel'
+        if sku.startswith('SKU_02'): return 'Home Goods'
+        if sku.startswith('SKU_03'): return 'Food & Beverage'
+        return 'Miscellaneous'
+    df_transformed['product_category'] = df_transformed['sku'].apply(get_product_category)
+
+    # 4. Flag Stock Status (Overstock/Understock)
+    # This is a simplified logic. In a real system, you'd use min/max stock levels,
+    # safety stock, demand forecasts, lead times, etc.
+
+    # Calculate average historical quantity for each SKU (across all warehouses for simplicity)
+    # This requires looking at all historical data, which is available in df_transformed if it spans days.
+    # For a true "real-time" check, you'd compare against predefined min/max levels or a moving average.
+    # Let's use a simple average over the available data for now.
+    sku_avg_qty = df_transformed.groupby('sku')['quantity'].mean().reset_index()
+    sku_avg_qty.rename(columns={'quantity': 'avg_historical_qty'}, inplace=True)
+    df_transformed = pd.merge(df_transformed, sku_avg_qty, on='sku', how='left')
+
+    df_transformed['is_overstock'] = df_transformed.apply(
+        lambda row: row['quantity'] > (row['avg_historical_qty'] * OVERSTOCK_THRESHOLD_MULTIPLIER), axis=1
+    )
+    df_transformed['is_understock'] = df_transformed['quantity'] < UNDERSTOCK_THRESHOLD_ABSOLUTE
+
+    df_transformed.drop(columns=['avg_historical_qty'], inplace=True) # Remove temporary column
+
+    print(f"Transformation complete. Resulting DataFrame has {len(df_transformed)} records.")
+    return df_transformed
+
+# --- Data Loading ---
+def load_unified_inventory_to_db(df_unified_inventory: pd.DataFrame, db_session_factory):
+    """
+    Loads the transformed and unified inventory data into the database.
+    This function will upsert (update if exists, insert if not) based on SKU and warehouse_id
+    for the latest snapshot date.
+    """
+    if df_unified_inventory.empty:
+        print("No unified inventory data to load.")
+        return
+
+    print(f"Loading {len(df_unified_inventory)} unified inventory records into the database...")
+    with db_session_factory() as db:
+        for index, row in df_unified_inventory.iterrows():
+            # For daily snapshots, we want to ensure uniqueness per SKU, warehouse, and date.
+            # If running daily, we'd typically clear old daily data or ensure upsert on date.
+            # For this example, we'll assume we're loading "latest" state for a given day.
+            # A more robust upsert would check for (sku, warehouse_id, date_part(last_updated)).
+            # For simplicity, we'll just add; if running multiple times on same day, it will add duplicates
+            # unless a unique constraint is added to the table on (sku, warehouse_id, date_part(last_updated)).
+            # For this demo, we'll just insert. If you need true upsert, it's more complex with SQLAlchemy.
+
+            # Simplified: just add new records. If running daily, this is fine for new data.
+            # For updating existing records for the *same* day, you'd need to query and update.
+            # For demo purposes, we'll rely on primary key for uniqueness if UUID is generated per run.
+            # To prevent duplicates on (sku, warehouse_id, date), you'd need a unique constraint in DB
+            # and then handle IntegrityError or use a more complex upsert logic.
+
+            inventory_entry = InventoryRecord(
+                sku=row['sku'],
+                warehouse_id=row['warehouse_id'],
+                quantity=row['quantity'],
+                last_updated=row['last_updated'],
+                product_category=row['product_category'],
+                is_overstock=row['is_overstock'],
+                is_understock=row['is_understock']
+            )
+            db.add(inventory_entry)
+        try:
+            db.commit()
+            print("Unified inventory data loaded successfully.")
+        except IntegrityError as e:
+            db.rollback()
+            print(f"Error loading data (possible duplicate): {e}")
+            print("Consider adding a unique constraint on (sku, warehouse_id, date(last_updated)) and handling upserts.")
+        except Exception as e:
+            db.rollback()
+            print(f"An unexpected error occurred during database load: {e}")
+
+# --- Reporting and Visualization ---
+def generate_inventory_report(db_session_factory):
+    """
+    Fetches unified inventory data from the database and generates a report.
+    """
+    print("\n--- Generating Inventory Report ---")
+
+    with db_session_factory() as db:
+        # Fetch all inventory records
+        inventory_records = db.query(InventoryRecord).all()
+        if not inventory_records:
+            print("No inventory data found for reporting.")
+            return
+
+        df_inventory = pd.DataFrame([{
+            'sku': rec.sku,
+            'warehouse_id': rec.warehouse_id,
+            'quantity': rec.quantity,
+            'last_updated': rec.last_updated,
+            'product_category': rec.product_category,
+            'is_overstock': rec.is_overstock,
+            'is_understock': rec.is_understock
+        } for rec in inventory_records])
+
+    if df_inventory.empty:
+        print("No data to report.")
+        return
+
+    df_inventory['last_updated_date'] = df_inventory['last_updated'].dt.date
+
+    # Report 1: Current Stock Summary by SKU (latest snapshot)
+    latest_inventory = df_inventory.sort_values('last_updated', ascending=False).drop_duplicates(subset=['sku', 'warehouse_id'])
+    print("\n--- Latest Inventory Summary (by SKU and Warehouse) ---")
+    print(latest_inventory[['sku', 'warehouse_id', 'quantity', 'product_category', 'is_overstock', 'is_understock']].head(10)) # Show first 10
+
+    # Report 2: Total Stock by Product Category
+    total_stock_by_category = latest_inventory.groupby('product_category')['quantity'].sum().sort_values(ascending=False).reset_index()
+    print("\n--- Total Stock by Product Category ---")
+    print(total_stock_by_category)
+
+    # Report 3: Flagged SKUs (Overstock/Understock)
+    flagged_skus = latest_inventory[(latest_inventory['is_overstock']) | (latest_inventory['is_understock'])]
+    if not flagged_skus.empty:
+        print("\n--- Flagged SKUs (Overstock/Understock) ---")
+        print(flagged_skus[['sku', 'warehouse_id', 'quantity', 'product_category', 'is_overstock', 'is_understock']])
+    else:
+        print("\nNo SKUs currently flagged as overstock or understock.")
+
+    # --- Visualizations ---
+    # Plot 1: Total Quantity by Product Category
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x='product_category', y='quantity', data=total_stock_by_category, palette='viridis')
+    plt.title('Total Inventory Quantity by Product Category')
+    plt.xlabel('Product Category')
+    plt.ylabel('Total Quantity')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: Inventory Level Trends for a few sample SKUs
+    sample_skus = df_inventory['sku'].sample(min(5, len(df_inventory['sku'].unique()))).tolist()
+    if sample_skus:
+        plt.figure(figsize=(14, 7))
+        for sku in sample_skus:
+            sku_df = df_inventory[df_inventory['sku'] == sku].sort_values('last_updated')
+            sns.lineplot(x='last_updated', y='quantity', data=sku_df, label=f'SKU: {sku}', marker='o', errorbar=None)
+        plt.title('Inventory Level Trends for Sample SKUs')
+        plt.xlabel('Date')
+        plt.ylabel('Quantity')
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.xticks(rotation=45, ha='right')
+        plt.legend(title='SKU')
+        plt.tight_layout()
+        plt.show()
+
+    print("Inventory reports and visualizations generated.")
+
+# --- Main ETL Pipeline Execution ---
+if __name__ == "__main__":
+    print("--- Running Supply Chain ETL for Real-Time Inventory ---")
+
+    all_raw_dfs = []
+    for i in range(NUM_WAREHOUSES):
+        warehouse_id = f"WH_{i+1}"
+        # Simulate data for all days for each warehouse
+        df_warehouse = simulate_warehouse_data(warehouse_id, NUM_SKUS, DAYS_OF_DATA)
+        all_raw_dfs.append(df_warehouse)
+
+    # 1. Extract (Simulated)
+    # Concatenate all raw dataframes from different warehouses
+    raw_inventory_df = pd.concat(all_raw_dfs, ignore_index=True)
+    print(f"\nTotal raw records extracted from all warehouses: {len(raw_inventory_df)}")
+
+    # 2. Transform
+    unified_inventory_df = transform_inventory_data(raw_inventory_df)
+
+    # 3. Load
+    load_unified_inventory_to_db(unified_inventory_df, SessionLocal)
+
+    # --- Reporting and Visualization ---
+    generate_inventory_report(SessionLocal)
+
+    print("\nSupply Chain ETL for Real-Time Inventory pipeline completed.")
+    print(f"Unified inventory data stored in '{DATABASE_URL.split('///')[-1]}'.")
+
