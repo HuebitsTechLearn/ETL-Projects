@@ -1,0 +1,365 @@
+import pandas as pd
+import datetime
+import random
+import numpy as np
+import uuid # For generating unique IDs
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# Scikit-learn for machine learning models
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Matplotlib and Seaborn for visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# Using SQLite for simplicity. For PostgreSQL, change this to:
+# "postgresql://user:password@host:port/database_name"
+# Ensure you have 'psycopg2-binary' installed for PostgreSQL.
+DATABASE_URL = "sqlite:///./transport_demand_analytics.db"
+
+# Define the geographic area for simulation (e.g., a city block)
+MIN_LAT, MAX_LAT = 34.0, 34.1 # Example latitude range
+MIN_LON, MAX_LON = -118.3, -118.2 # Example longitude range
+
+# Number of grid cells for spatial binning
+LAT_BINS = 10
+LON_BINS = 10
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the TripData model (for raw extracted data - optional, could be just in-memory for ETL)
+# For a real system, raw data might be stored in a data lake or staging area.
+class RawTripData(Base):
+    __tablename__ = "raw_trip_data"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    trip_id = Column(String, unique=True, nullable=False)
+    pickup_timestamp = Column(DateTime, nullable=False)
+    dropoff_timestamp = Column(DateTime, nullable=False)
+    pickup_latitude = Column(Float, nullable=False)
+    pickup_longitude = Column(Float, nullable=False)
+    dropoff_latitude = Column(Float, nullable=False)
+    dropoff_longitude = Column(Float, nullable=False)
+    fare_amount = Column(Float, nullable=False)
+
+    def __repr__(self):
+        return f"<RawTripData(trip_id='{self.trip_id}', pickup_time='{self.pickup_timestamp}')>"
+
+# Define the AggregatedDemand model
+class AggregatedDemand(Base):
+    __tablename__ = "aggregated_demand"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    # Use UTC for timestamps
+    snapshot_date = Column(DateTime, nullable=False)
+    hour_of_day = Column(Integer, nullable=False)
+    day_of_week = Column(Integer, nullable=False) # Monday=0, Sunday=6
+    zone_id = Column(String, nullable=False, index=True) # Combined lat/lon bin
+    num_trips = Column(Integer, default=0)
+    avg_fare = Column(Float, default=0.0)
+    avg_trip_duration_minutes = Column(Float, default=0.0)
+
+    def __repr__(self):
+        return (f"<AggregatedDemand(zone='{self.zone_id}', date='{self.snapshot_date.strftime('%Y-%m-%d')}', "
+                f"hour={self.hour_of_day}, trips={self.num_trips})>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Simulated Data Extraction ---
+def extract_trip_data(num_trips=10000, days_of_data=30):
+    """
+    Simulates extracting raw trip data.
+    Generates data for a specified number of trips over a period of days.
+    """
+    print(f"Extracting {num_trips} simulated trip records over {days_of_data} days...")
+    trip_data = []
+    end_date = datetime.datetime.now(datetime.timezone.utc)
+    start_date = end_date - datetime.timedelta(days=days_of_data)
+
+    for _ in range(num_trips):
+        # Random pickup time within the data range
+        pickup_timestamp = start_date + datetime.timedelta(
+            days=random.randint(0, days_of_data - 1),
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59),
+            seconds=random.randint(0, 59)
+        )
+        # Simulate trip duration (5 to 60 minutes)
+        trip_duration_minutes = random.randint(5, 60)
+        dropoff_timestamp = pickup_timestamp + datetime.timedelta(minutes=trip_duration_minutes)
+
+        # Simulate pickup/dropoff locations within the defined bounds
+        pickup_lat = random.uniform(MIN_LAT, MAX_LAT)
+        pickup_lon = random.uniform(MIN_LON, MAX_LON)
+        dropoff_lat = random.uniform(MIN_LAT, MAX_LAT)
+        dropoff_lon = random.uniform(MIN_LON, MAX_LON)
+
+        # Simulate fare amount based on duration and distance
+        fare_amount = round(random.uniform(5, 50) + (trip_duration_minutes * 0.5), 2)
+
+        trip_data.append({
+            'trip_id': str(uuid.uuid4()),
+            'pickup_timestamp': pickup_timestamp,
+            'dropoff_timestamp': dropoff_timestamp,
+            'pickup_latitude': pickup_lat,
+            'pickup_longitude': pickup_lon,
+            'dropoff_latitude': dropoff_lat,
+            'dropoff_longitude': dropoff_lon,
+            'fare_amount': fare_amount
+        })
+
+    df = pd.DataFrame(trip_data)
+    df['pickup_timestamp'] = pd.to_datetime(df['pickup_timestamp'])
+    df['dropoff_timestamp'] = pd.to_datetime(df['dropoff_timestamp'])
+    print(f"Extracted {len(df)} raw trip records.")
+    return df
+
+# --- Transformation Logic ---
+def transform_to_demand_matrix(df_raw_trips: pd.DataFrame):
+    """
+    Transforms raw trip data into aggregated demand metrics per zone, hour, and day.
+    """
+    print("Transforming raw trip data into demand matrix...")
+
+    if df_raw_trips.empty:
+        print("Raw trip data is empty, skipping transformation.")
+        return pd.DataFrame()
+
+    # Feature Engineering: Extract time-based features
+    df_raw_trips['pickup_hour'] = df_raw_trips['pickup_timestamp'].dt.hour
+    df_raw_trips['pickup_day_of_week'] = df_raw_trips['pickup_timestamp'].dt.dayofweek # Monday=0, Sunday=6
+    df_raw_trips['pickup_date'] = df_raw_trips['pickup_timestamp'].dt.date # For daily snapshots
+
+    # Spatial Binning: Create zones based on latitude and longitude
+    # This is a simplified grid approach. For real-world, use Geopandas for more complex geometries.
+    lat_bin_size = (MAX_LAT - MIN_LAT) / LAT_BINS
+    lon_bin_size = (MAX_LON - MIN_LON) / LON_BINS
+
+    df_raw_trips['lat_bin'] = np.floor((df_raw_trips['pickup_latitude'] - MIN_LAT) / lat_bin_size).astype(int)
+    df_raw_trips['lon_bin'] = np.floor((df_raw_trips['pickup_longitude'] - MIN_LON) / lon_bin_size).astype(int)
+    df_raw_trips['zone_id'] = df_raw_trips['lat_bin'].astype(str) + '_' + df_raw_trips['lon_bin'].astype(str)
+
+    # Calculate trip duration in minutes
+    df_raw_trips['trip_duration_minutes'] = (df_raw_trips['dropoff_timestamp'] - df_raw_trips['pickup_timestamp']).dt.total_seconds() / 60
+
+    # Aggregate metrics by zone, hour, and day
+    demand_df = df_raw_trips.groupby(['pickup_date', 'zone_id', 'pickup_hour', 'pickup_day_of_week']).agg(
+        num_trips=('trip_id', 'count'),
+        avg_fare=('fare_amount', 'mean'),
+        avg_trip_duration_minutes=('trip_duration_minutes', 'mean')
+    ).reset_index()
+
+    # Rename columns for clarity
+    demand_df.rename(columns={
+        'pickup_date': 'snapshot_date',
+        'pickup_hour': 'hour_of_day',
+        'pickup_day_of_week': 'day_of_week'
+    }, inplace=True)
+
+    # Convert snapshot_date to datetime objects (it's currently date objects)
+    demand_df['snapshot_date'] = pd.to_datetime(demand_df['snapshot_date'])
+
+    print(f"Transformed into {len(demand_df)} demand records.")
+    return demand_df
+
+# --- Loading Data ---
+def load_demand_data_to_database(df_demand: pd.DataFrame, db_session_factory):
+    """
+    Loads the transformed demand data into the database.
+    """
+    if df_demand.empty:
+        print("No demand data to load to the database.")
+        return
+
+    print(f"Loading {len(df_demand)} demand records into the database...")
+    with db_session_factory() as db:
+        for index, row in df_demand.iterrows():
+            demand_entry = AggregatedDemand(
+                snapshot_date=row['snapshot_date'],
+                hour_of_day=row['hour_of_day'],
+                day_of_week=row['day_of_week'],
+                zone_id=row['zone_id'],
+                num_trips=row['num_trips'],
+                avg_fare=row['avg_fare'],
+                avg_trip_duration_minutes=row['avg_trip_duration_minutes']
+            )
+            db.add(demand_entry)
+        db.commit()
+    print("Demand data loaded successfully.")
+
+# --- Predictive Modeling ---
+def train_and_predict_demand(db_session_factory, target_date: datetime.datetime, target_hour: int, target_zone: str = None):
+    """
+    Fetches historical demand data, trains a Linear Regression model,
+    and makes a prediction for a specified future date, hour, and zone.
+    """
+    print("\n--- Training and Predicting Demand ---")
+
+    with db_session_factory() as db:
+        # Fetch all historical aggregated demand data
+        historical_demand_records = db.query(AggregatedDemand).all()
+        if not historical_demand_records:
+            print("No historical demand data found to train the model.")
+            return
+
+        # Convert to DataFrame
+        data = [{
+            'snapshot_date': rec.snapshot_date,
+            'hour_of_day': rec.hour_of_day,
+            'day_of_week': rec.day_of_week,
+            'zone_id': rec.zone_id,
+            'num_trips': rec.num_trips
+        } for rec in historical_demand_records]
+        df_historical = pd.DataFrame(data)
+
+    # Feature Engineering for the model
+    # Convert zone_id to numerical using one-hot encoding
+    df_historical = pd.get_dummies(df_historical, columns=['zone_id'], prefix='zone')
+
+    # Define features (X) and target (y)
+    features = [col for col in df_historical.columns if col not in ['snapshot_date', 'num_trips']]
+    X = df_historical[features]
+    y = df_historical['num_trips']
+
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Train the Linear Regression model
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+
+    # Evaluate the model
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    print(f"Model Mean Squared Error: {mse:.2f}")
+    print(f"Model R-squared: {r2:.2f}")
+
+    # Make a prediction for a target scenario
+    # Create a DataFrame for the prediction input
+    prediction_input = pd.DataFrame({
+        'hour_of_day': [target_hour],
+        'day_of_week': [target_date.weekday()] # target_date.weekday() gives 0 for Monday
+    })
+
+    # Add dummy columns for all possible zones that the model was trained on
+    for col in [f for f in features if f.startswith('zone_')]:
+        prediction_input[col] = 0 # Initialize all zone dummies to 0
+    if target_zone:
+        target_zone_col = f'zone_{target_zone}'
+        if target_zone_col in prediction_input.columns:
+            prediction_input[target_zone_col] = 1 # Set the target zone to 1
+        else:
+            print(f"Warning: Target zone '{target_zone}' not found in training data zones. Prediction might be inaccurate.")
+            # If target_zone is not in training data, the dummy variable for it won't exist.
+            # We need to ensure the prediction_input has the same columns as X_train.
+            # For simplicity, we'll just proceed, but in a real system, handle unseen zones.
+
+    # Ensure prediction_input has all columns present in X_train, fill missing with 0
+    missing_cols = set(X_train.columns) - set(prediction_input.columns)
+    for c in missing_cols:
+        prediction_input[c] = 0
+    prediction_input = prediction_input[X_train.columns] # Ensure column order matches training data
+
+    predicted_trips = model.predict(prediction_input)[0]
+    # Ensure prediction is not negative
+    predicted_trips = max(0, round(predicted_trips))
+
+    print(f"\nPredicted demand for {target_date.strftime('%Y-%m-%d')}, Hour {target_hour}, Zone '{target_zone if target_zone else 'All Zones'}' is: {predicted_trips} trips")
+
+    return model, predicted_trips
+
+# --- Visualization ---
+def visualize_demand(db_session_factory):
+    """
+    Fetches aggregated demand data and visualizes demand patterns.
+    """
+    print("\n--- Generating Demand Visualizations ---")
+
+    with db_session_factory() as db:
+        # Fetch all historical aggregated demand data
+        historical_demand_records = db.query(AggregatedDemand).all()
+        if not historical_demand_records:
+            print("No historical demand data found for visualization.")
+            return
+
+        data = [{
+            'snapshot_date': rec.snapshot_date,
+            'hour_of_day': rec.hour_of_day,
+            'day_of_week': rec.day_of_week,
+            'zone_id': rec.zone_id,
+            'num_trips': rec.num_trips
+        } for rec in historical_demand_records]
+        df_historical = pd.DataFrame(data)
+
+    if df_historical.empty:
+        print("No data to visualize.")
+        return
+
+    # Plot 1: Average Number of Trips by Hour of Day
+    plt.figure(figsize=(12, 6))
+    sns.barplot(x='hour_of_day', y='num_trips', data=df_historical.groupby('hour_of_day')['num_trips'].mean().reset_index())
+    plt.title('Average Number of Trips by Hour of Day')
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Average Number of Trips')
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: Demand Heatmap by Zone (simplified - using counts of zones)
+    # This creates a heatmap of activity across the binned lat/lon grid
+    # To make it a true heatmap, we'd need to reconstruct the grid.
+    # For now, let's show top zones by average trips.
+    top_zones = df_historical.groupby('zone_id')['num_trips'].mean().nlargest(10).reset_index()
+    if not top_zones.empty:
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x='zone_id', y='num_trips', data=top_zones, palette='viridis')
+        plt.title('Top 10 Zones by Average Number of Trips')
+        plt.xlabel('Zone ID (Lat_Bin_Lon_Bin)')
+        plt.ylabel('Average Number of Trips')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+    print("Visualizations generated.")
+    print("For interactive heatmaps (e.g., geospatial), consider Plotly or Folium.")
+
+
+# --- Main ETL Pipeline Execution ---
+if __name__ == "__main__":
+    # --- ETL Process ---
+    # 1. Extract
+    raw_trips_df = extract_trip_data(num_trips=20000, days_of_data=60) # Simulate more data for better prediction
+
+    # 2. Transform
+    demand_kpis_df = transform_to_demand_matrix(raw_trips_df)
+
+    # 3. Load
+    load_demand_data_to_database(demand_kpis_df, SessionLocal)
+
+    # --- Predictive Analytics ---
+    # Example: Predict demand for tomorrow at 8 AM in a specific zone (e.g., '5_5')
+    tomorrow = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+    # Find a common zone_id from the generated data to use for prediction example
+    # In a real scenario, you'd pick a known zone or iterate through zones.
+    sample_zone = demand_kpis_df['zone_id'].sample(1).iloc[0] if not demand_kpis_df.empty else '0_0'
+
+    model, predicted_trips = train_and_predict_demand(SessionLocal, tomorrow, 8, sample_zone)
+
+    # --- Visualization ---
+    visualize_demand(SessionLocal)
+
+    print("\nSmart Transport Demand Prediction System pipeline completed.")
+    print(f"Check '{DATABASE_URL.split('///')[-1]}' for the stored data.")
