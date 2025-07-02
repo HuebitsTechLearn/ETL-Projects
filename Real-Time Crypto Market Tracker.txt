@@ -1,0 +1,285 @@
+import asyncio
+import websockets
+import json
+import datetime
+import pandas as pd
+import streamlit as st
+import threading
+import time
+import collections
+import uuid # For generating unique IDs for database entries
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, Float, String, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# --- Configuration ---
+# IMPORTANT: Replace with your PostgreSQL connection string.
+# Example: "postgresql://user:password@host:port/database_name"
+# Ensure your PostgreSQL server is running and accessible.
+DATABASE_URL = "postgresql://your_user:your_password@localhost:5432/your_database"
+
+# Cryptocurrencies to track (Binance symbols)
+CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+# --- Database Setup (SQLAlchemy) ---
+# Create a database engine
+engine = create_engine(DATABASE_URL)
+
+# Declare a base for declarative models
+Base = declarative_base()
+
+# Define the CryptoPrice model
+class CryptoPrice(Base):
+    __tablename__ = "crypto_prices"
+    # Using UUID as primary key for uniqueness and distributed generation
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    symbol = Column(String, index=True, nullable=False)
+    price = Column(Float, nullable=False)
+    # Use UTC for timestamps to avoid timezone issues
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<CryptoPrice(symbol='{self.symbol}', price={self.price}, timestamp='{self.timestamp}')>"
+
+# Create tables in the database if they don't exist
+# This will only create tables that don't already exist
+Base.metadata.create_all(engine)
+
+# Create a session factory to interact with the database
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- WebSocket Data Ingestion ---
+async def connect_binance_websocket(symbol: str, price_history_deque: collections.deque, db_session_factory):
+    """
+    Connects to the Binance WebSocket API for a given symbol,
+    ingests real-time trade data, stores it in the database,
+    and updates an in-memory deque for dashboard display.
+    """
+    # Binance WebSocket URI for trade streams
+    uri = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
+    print(f"Attempting to connect to WebSocket for {symbol} at {uri}")
+
+    while st.session_state.is_running: # Loop to keep trying to connect if disconnected
+        try:
+            async with websockets.connect(uri) as websocket:
+                print(f"Successfully connected to WebSocket for {symbol}")
+                while st.session_state.is_running: # Loop to receive messages
+                    try:
+                        message = await websocket.recv()
+                        data = json.loads(message)
+
+                        # Check if the message contains trade data (price 'p', symbol 's', event time 'E')
+                        if 'p' in data and 's' in data and 'E' in data:
+                            price = float(data['p'])
+                            timestamp_ms = int(data['E'])
+                            # Convert milliseconds timestamp to UTC datetime object
+                            timestamp = datetime.datetime.fromtimestamp(timestamp_ms / 1000, tz=datetime.timezone.utc)
+                            symbol_name = data['s']
+
+                            # Store data in PostgreSQL
+                            try:
+                                with db_session_factory() as db:
+                                    crypto_entry = CryptoPrice(symbol=symbol_name, price=price, timestamp=timestamp)
+                                    db.add(crypto_entry)
+                                    db.commit() # Commit the transaction to save to DB
+                                    db.refresh(crypto_entry) # Refresh to get any database-generated values (e.g., default timestamp)
+                            except Exception as db_err:
+                                print(f"Database error for {symbol}: {db_err}")
+                                db.rollback() # Rollback in case of error
+
+                            # Update in-memory cache for Streamlit dashboard
+                            # Append a dictionary with symbol, price, and timestamp
+                            price_history_deque.append({'symbol': symbol_name, 'price': price, 'timestamp': timestamp})
+
+                            # Update the latest price for the specific symbol in session state
+                            st.session_state.latest_prices[symbol_name] = price
+
+                        await asyncio.sleep(0.01) # Small delay to yield control and prevent busy-waiting
+
+                    except websockets.exceptions.ConnectionClosedOK:
+                        print(f"WebSocket connection for {symbol} closed gracefully. Reconnecting...")
+                        break # Break inner loop to try outer loop's reconnect logic
+                    except websockets.exceptions.ConnectionClosedError as e:
+                        print(f"WebSocket connection for {symbol} closed with error: {e}. Reconnecting...")
+                        break
+                    except json.JSONDecodeError:
+                        print(f"Received malformed JSON for {symbol}: {message}")
+                    except Exception as e:
+                        print(f"Error processing WebSocket message for {symbol}: {e}")
+                        # Consider breaking or sleeping if errors are persistent
+                        await asyncio.sleep(1)
+
+        except ConnectionRefusedError:
+            print(f"Connection refused for {symbol}. Is the WebSocket server running? Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"General WebSocket connection error for {symbol}: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+
+def run_websocket_in_thread(symbol: str, price_history_deque: collections.deque, db_session_factory):
+    """
+    Wrapper function to run the async WebSocket client in a separate thread.
+    `asyncio.run()` is used to run the async function in the new event loop
+    created for this thread.
+    """
+    asyncio.run(connect_binance_websocket(symbol, price_history_deque, db_session_factory))
+
+# --- Streamlit Dashboard UI ---
+# Set Streamlit page configuration for a wide layout and a custom title
+st.set_page_config(layout="wide", page_title="Real-Time Crypto Market Tracker")
+
+# Main title for the dashboard
+st.title("📈 Real-Time Crypto Market Tracker")
+
+# Initialize Streamlit session state variables if they don't exist
+# `latest_prices`: Stores the most recent price for each tracked symbol.
+# `price_history`: A deque to hold a rolling window of recent price data for calculations.
+# `is_running`: A boolean flag to control the WebSocket threads.
+# `websocket_threads`: A dictionary to keep track of active WebSocket thread objects.
+if 'latest_prices' not in st.session_state:
+    st.session_state.latest_prices = {symbol: 0.0 for symbol in CRYPTO_SYMBOLS}
+    # Maxlen limits the deque size, automatically dropping old entries
+    st.session_state.price_history = collections.deque(maxlen=5000) # Store enough data for 15-min avg at 0.1s updates
+    st.session_state.is_running = False
+    st.session_state.websocket_threads = {}
+
+# Layout for Start/Stop buttons
+col1, col2 = st.columns([1, 10]) # First column for buttons, second for spacing
+
+with col1:
+    # Start Tracking button
+    if st.button("Start Tracking", help="Click to start real-time data ingestion and dashboard updates"):
+        if not st.session_state.is_running:
+            st.session_state.is_running = True
+            st.session_state.price_history.clear() # Clear history on start to avoid stale data
+            st.session_state.latest_prices = {symbol: 0.0 for symbol in CRYPTO_SYMBOLS} # Reset latest prices
+
+            # Start a separate thread for each cryptocurrency's WebSocket connection
+            for symbol in CRYPTO_SYMBOLS:
+                thread = threading.Thread(
+                    target=run_websocket_in_thread,
+                    args=(symbol, st.session_state.price_history, SessionLocal),
+                    daemon=True # Daemon threads exit when the main program exits
+                )
+                thread.start()
+                st.session_state.websocket_threads[symbol] = thread
+            st.success("Real-time tracking started! Data will appear shortly.")
+        else:
+            st.info("Tracking is already running.")
+
+    # Stop Tracking button
+    if st.button("Stop Tracking", help="Click to stop data ingestion and dashboard updates"):
+        if st.session_state.is_running:
+            st.session_state.is_running = False
+            # Attempt to join threads to ensure they terminate gracefully
+            for symbol, thread in st.session_state.websocket_threads.items():
+                if thread.is_alive():
+                    print(f"Attempting to join thread for {symbol}...")
+                    thread.join(timeout=5) # Wait up to 5 seconds for thread to finish
+                    if thread.is_alive():
+                        print(f"Thread for {symbol} did not terminate gracefully.")
+            st.session_state.websocket_threads = {} # Clear thread references
+            st.warning("Real-time tracking stopped.")
+        else:
+            st.info("Tracking is not currently running.")
+
+# Display placeholders for metrics and charts
+# Using st.empty() allows us to update content dynamically in the loop
+st.markdown("---") # Separator for better visual organization
+
+st.subheader("Current Prices & Momentum")
+price_cols = st.columns(len(CRYPTO_SYMBOLS))
+price_placeholders = {}
+momentum_placeholders = {}
+for i, symbol in enumerate(CRYPTO_SYMBOLS):
+    with price_cols[i]:
+        price_placeholders[symbol] = st.empty()
+        momentum_placeholders[symbol] = st.empty()
+
+st.subheader("Rolling Averages")
+avg_cols = st.columns(len(CRYPTO_SYMBOLS))
+avg_5min_placeholders = {}
+avg_15min_placeholders = {}
+for i, symbol in enumerate(CRYPTO_SYMBOLS):
+    with avg_cols[i]:
+        avg_5min_placeholders[symbol] = st.empty()
+        avg_15min_placeholders[symbol] = st.empty()
+
+st.markdown("---")
+
+# Main Streamlit update loop
+# This loop continuously updates the dashboard if tracking is active
+while st.session_state.is_running:
+    # Update latest prices
+    for symbol in CRYPTO_SYMBOLS:
+        current_price = st.session_state.latest_prices.get(symbol, 0.0)
+        price_placeholders[symbol].metric(label=f"{symbol} Price", value=f"${current_price:,.2f}")
+
+    # Convert deque to DataFrame for easier time-series calculations
+    # Filter for data within the last 15 minutes for efficiency
+    df_history = pd.DataFrame(list(st.session_state.price_history))
+
+    if not df_history.empty:
+        df_history['timestamp'] = pd.to_datetime(df_history['timestamp'])
+        # Filter data to only include recent entries to speed up calculations
+        current_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+        recent_df = df_history[df_history['timestamp'] > (current_time - datetime.timedelta(minutes=16))] # 15 min + buffer
+
+        for symbol in CRYPTO_SYMBOLS:
+            # Filter history for the specific symbol and sort by timestamp
+            symbol_df = recent_df[recent_df['symbol'] == symbol].set_index('timestamp').sort_index()
+
+            if not symbol_df.empty:
+                # --- Calculate Rolling Averages ---
+                # Ensure there's enough data for the rolling window
+                if len(symbol_df) > 1: # Need at least 2 points to calculate change
+                    # Simple Momentum (Price Change from previous data point)
+                    current_price_val = symbol_df['price'].iloc[-1]
+                    # Find the previous price that is not the same as the current one to show actual change
+                    # This handles cases where multiple updates might have the same price in a short interval
+                    prev_prices = symbol_df['price'].iloc[:-1]
+                    if not prev_prices.empty:
+                        prev_price_val = prev_prices.iloc[-1]
+                        price_change = current_price_val - prev_price_val
+                        change_percent = (price_change / prev_price_val) * 100 if prev_price_val != 0 else 0
+
+                        color = "green" if price_change >= 0 else "red"
+                        # Display momentum with color coding
+                        momentum_placeholders[symbol].markdown(
+                            f"**Change:** <span style='color:{color}'>{price_change:+.2f} ({change_percent:+.2f}%)</span>",
+                            unsafe_allow_html=True # Allow HTML for colored text
+                        )
+
+                # Calculate 5-minute rolling average
+                # Using `closed='right'` means the current timestamp is included in the window
+                rolling_5min = symbol_df['price'].rolling('5min', closed='right').mean().iloc[-1] if len(symbol_df) > 0 else 0.0
+                avg_5min_placeholders[symbol].markdown(f"**{symbol} 5-min Avg:** ${rolling_5min:,.2f}")
+
+                # Calculate 15-minute rolling average
+                rolling_15min = symbol_df['price'].rolling('15min', closed='right').mean().iloc[-1] if len(symbol_df) > 0 else 0.0
+                avg_15min_placeholders[symbol].markdown(f"**{symbol} 15-min Avg:** ${rolling_15min:,.2f}")
+            else:
+                # If no data for symbol, clear placeholders
+                price_placeholders[symbol].metric(label=f"{symbol} Price", value="$0.00")
+                momentum_placeholders[symbol].markdown(f"**Change:** N/A")
+                avg_5min_placeholders[symbol].markdown(f"**{symbol} 5-min Avg:** N/A")
+                avg_15min_placeholders[symbol].markdown(f"**{symbol} 15-min Avg:** N/A" )
+
+    else:
+        # If no data in history, clear all placeholders
+        for symbol in CRYPTO_SYMBOLS:
+            price_placeholders[symbol].metric(label=f"{symbol} Price", value="$0.00")
+            momentum_placeholders[symbol].markdown(f"**Change:** N/A")
+            avg_5min_placeholders[symbol].markdown(f"**{symbol} 5-min Avg:** N/A")
+            avg_15min_placeholders[symbol].markdown(f"**{symbol} 15-min Avg:** N/A")
+
+
+    time.sleep(1) # Update dashboard every 1 second
+    st.rerun() # Rerun the Streamlit app to refresh the UI
+
+# Message displayed when tracking is not active
+if not st.session_state.is_running:
+    st.info("Click 'Start Tracking' to begin monitoring crypto prices in real-time.")
+
