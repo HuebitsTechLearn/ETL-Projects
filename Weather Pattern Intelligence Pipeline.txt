@@ -1,0 +1,229 @@
+import requests
+import pandas as pd
+import datetime
+import json
+import os # For file path operations
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# Matplotlib and Seaborn for visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# IMPORTANT: Replace with your actual OpenWeatherMap API Key
+# You can get one by signing up at https://openweathermap.org/api
+OPENWEATHERMAP_API_KEY = "YOUR_OPENWEATHERMAP_API_KEY"
+BASE_URL = "http://api.openweathermap.org/data/2.5/weather"
+
+# Cities to track (you can add more)
+CITIES = ["London", "New York", "Tokyo", "Visakhapatnam"]
+
+# File paths for data storage
+CSV_FILE_PATH = "weather_data_lake.csv"
+DATABASE_URL = "sqlite:///./weather_analytics.db" # SQLite database file
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the WeatherData model
+class WeatherData(Base):
+    __tablename__ = "weather_records"
+    id = Column(Integer, primary_key=True, autoincrement=True) # Auto-incrementing primary key
+    city = Column(String, nullable=False, index=True)
+    country = Column(String)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False) # UTC timestamp
+    temperature_celsius = Column(Float)
+    humidity_percent = Column(Integer)
+    wind_speed_mps = Column(Float) # Meters per second
+    weather_description = Column(String)
+
+    def __repr__(self):
+        return (f"<WeatherData(city='{self.city}', temp={self.temperature_celsius:.1f}°C, "
+                f"desc='{self.weather_description}', time='{self.timestamp.strftime('%Y-%m-%d %H:%M')}')>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Data Extraction ---
+def extract_weather_data(api_key: str, city_name: str):
+    """
+    Fetches current weather data for a given city from OpenWeatherMap API.
+    Returns a dictionary of weather data or None if an error occurs.
+    """
+    params = {
+        "q": city_name,
+        "appid": api_key,
+        "units": "metric" # For Celsius
+    }
+    try:
+        response = requests.get(BASE_URL, params=params)
+        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+        data = response.json()
+        print(f"Successfully fetched data for {city_name}.")
+        return data
+    except requests.exceptions.HTTPError as http_err:
+        print(f"HTTP error occurred for {city_name}: {http_err} - {response.text}")
+    except requests.exceptions.ConnectionError as conn_err:
+        print(f"Connection error occurred for {city_name}: {conn_err}")
+    except requests.exceptions.Timeout as timeout_err:
+        print(f"Timeout error occurred for {city_name}: {timeout_err}")
+    except requests.exceptions.RequestException as req_err:
+        print(f"An unexpected error occurred for {city_name}: {req_err}")
+    except json.JSONDecodeError:
+        print(f"Failed to decode JSON response for {city_name}.")
+    return None
+
+# --- Data Transformation ---
+def transform_weather_data(raw_data: dict):
+    """
+    Transforms raw OpenWeatherMap JSON data into a standardized dictionary.
+    """
+    if not raw_data:
+        return None
+
+    try:
+        transformed = {
+            "city": raw_data.get("name"),
+            "country": raw_data.get("sys", {}).get("country"),
+            "timestamp": datetime.datetime.utcnow(), # Use UTC for consistency
+            "temperature_celsius": raw_data.get("main", {}).get("temp"),
+            "humidity_percent": raw_data.get("main", {}).get("humidity"),
+            "wind_speed_mps": raw_data.get("wind", {}).get("speed"),
+            "weather_description": raw_data.get("weather", [{}])[0].get("description")
+        }
+        return transformed
+    except KeyError as e:
+        print(f"Missing expected key in raw data during transformation: {e}")
+        return None
+    except Exception as e:
+        print(f"An error occurred during data transformation: {e}")
+        return None
+
+# --- Data Loading ---
+def load_to_csv(df: pd.DataFrame, file_path: str):
+    """
+    Appends the DataFrame to a CSV file. Creates the file with headers if it doesn't exist.
+    """
+    if df.empty:
+        print("No data to load to CSV.")
+        return
+
+    # Check if file exists to decide whether to write header
+    file_exists = os.path.exists(file_path)
+    df.to_csv(file_path, mode='a', header=not file_exists, index=False)
+    print(f"Data appended to CSV: {file_path}")
+
+def load_to_database(df: pd.DataFrame, db_session_factory):
+    """
+    Loads the DataFrame into the SQLite/PostgreSQL database.
+    """
+    if df.empty:
+        print("No data to load to database.")
+        return
+
+    print(f"Loading {len(df)} records into the database...")
+    with db_session_factory() as db:
+        for index, row in df.iterrows():
+            weather_entry = WeatherData(
+                city=row['city'],
+                country=row['country'],
+                timestamp=row['timestamp'],
+                temperature_celsius=row['temperature_celsius'],
+                humidity_percent=row['humidity_percent'],
+                wind_speed_mps=row['wind_speed_mps'],
+                weather_description=row['weather_description']
+            )
+            db.add(weather_entry)
+        db.commit()
+    print("Data loaded to database successfully.")
+
+# --- Analysis and Visualization ---
+def visualize_temperature_trends(db_session_factory):
+    """
+    Fetches historical temperature data from the database and visualizes trends.
+    """
+    print("\n--- Generating Temperature Trend Visualization ---")
+
+    with db_session_factory() as db:
+        # Fetch all historical weather data
+        historical_records = db.query(WeatherData).all()
+        if not historical_records:
+            print("No historical weather data found for visualization.")
+            return
+
+        # Convert to DataFrame
+        data = [{
+            'city': rec.city,
+            'timestamp': rec.timestamp,
+            'temperature_celsius': rec.temperature_celsius
+        } for rec in historical_records]
+        df_historical = pd.DataFrame(data)
+
+    if df_historical.empty:
+        print("No data to visualize.")
+        return
+
+    df_historical['timestamp'] = pd.to_datetime(df_historical['timestamp'])
+    df_historical.set_index('timestamp', inplace=True)
+
+    # Plot average temperature over time for each city
+    plt.figure(figsize=(14, 7))
+    sns.lineplot(data=df_historical, x=df_historical.index, y='temperature_celsius', hue='city', marker='o', errorbar=None)
+    plt.title('Temperature Trends Over Time by City')
+    plt.xlabel('Timestamp (UTC)')
+    plt.ylabel('Temperature (°C)')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    print("Temperature trend visualization generated.")
+
+# --- Main ETL Pipeline Execution ---
+if __name__ == "__main__":
+    # Check if API key is set
+    if OPENWEATHERMAP_API_KEY == "YOUR_OPENWEATHERMAP_API_KEY":
+        print("ERROR: Please replace 'YOUR_OPENWEATHERMAP_API_KEY' with your actual OpenWeatherMap API key.")
+        print("You can get one from: https://openweathermap.org/api")
+        exit()
+
+    print("--- Running Weather Pattern Intelligence Pipeline ---")
+
+    all_transformed_data = []
+
+    # 1. Extract and Transform for each city
+    for city in CITIES:
+        raw_data = extract_weather_data(OPENWEATHERMAP_API_KEY, city)
+        transformed_data = transform_weather_data(raw_data)
+        if transformed_data:
+            all_transformed_data.append(transformed_data)
+
+    if not all_transformed_data:
+        print("No data was extracted or transformed. Exiting.")
+        exit()
+
+    df_current_weather = pd.DataFrame(all_transformed_data)
+
+    # 2. Load Data
+    # Load to CSV (simulating S3 data lake)
+    load_to_csv(df_current_weather, CSV_FILE_PATH)
+
+    # Load to Database (for structured analytics)
+    load_to_database(df_current_weather, SessionLocal)
+
+    # --- Analysis and Visualization ---
+    # This part would typically run periodically or on demand for reporting
+    visualize_temperature_trends(SessionLocal)
+
+    print("\nWeather Pattern Intelligence Pipeline completed.")
+    print(f"Raw data stored in '{CSV_FILE_PATH}'.")
+    print(f"Structured data stored in '{DATABASE_URL.split('///')[-1]}'.")
+
