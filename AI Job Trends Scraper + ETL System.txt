@@ -1,0 +1,388 @@
+import pandas as pd
+import datetime
+import random
+import uuid # For generating unique IDs
+import numpy as np
+import time
+import re # For regex in salary parsing
+from collections import Counter # For counting skills
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
+
+# Matplotlib and Seaborn for visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# Using SQLite for simplicity. For PostgreSQL, change this to:
+# "postgresql://user:password@host:port/database_name"
+# Ensure you have 'psycopg2-binary' installed for PostgreSQL.
+DATABASE_URL = "sqlite:///./ai_job_trends.db"
+
+# Number of simulated job listings
+NUM_JOB_LISTINGS = 1000
+# Number of days of historical data to simulate
+DAYS_OF_DATA = 90 # Simulate 3 months of job postings
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the JobPosting model
+class JobPosting(Base):
+    __tablename__ = "ai_job_postings"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_title = Column(String, nullable=False)
+    company = Column(String, nullable=False)
+    location = Column(String, nullable=False)
+    posted_date = Column(DateTime, nullable=False, index=True) # UTC timestamp
+    description = Column(Text) # Using Text for potentially long job descriptions
+    min_salary_usd = Column(Float) # Normalized to USD annual
+    max_salary_usd = Column(Float) # Normalized to USD annual
+    extracted_skills = Column(Text) # Storing as comma-separated string for simplicity
+    role_category = Column(String, index=True) # e.g., 'ML Engineer', 'Data Scientist'
+    source_url = Column(String) # Simulated URL
+
+    def __repr__(self):
+        return (f"<JobPosting(title='{self.job_title[:30]}...', company='{self.company}', "
+                f"location='{self.location}', role='{self.role_category}')>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Simulated Data Extraction ---
+def simulate_job_listings(num_listings: int, days_of_data: int):
+    """
+    Simulates extracting raw job listing data from various sources.
+    Generates data for a specified number of listings over a period of days.
+    """
+    print(f"Simulating {num_listings} AI/ML job listings over {days_of_data} days...")
+    job_data = []
+    end_date = datetime.datetime.now(datetime.timezone.utc)
+    start_date = end_date - datetime.timedelta(days=days_of_data - 1)
+
+    job_titles = [
+        "Machine Learning Engineer", "Data Scientist", "AI Researcher",
+        "NLP Engineer", "Computer Vision Engineer", "Deep Learning Engineer",
+        "Applied Scientist", "MLOps Engineer", "Data Engineer (ML Focus)",
+        "AI Product Manager", "Quantitative Researcher (AI)"
+    ]
+    companies = ["TechCorp", "InnovateAI", "GlobalData Solutions", "FutureWorks", "QuantumLeap Inc.", "AI Nexus"]
+    locations = ["New York, NY", "San Francisco, CA", "Seattle, WA", "Austin, TX", "Boston, MA", "London, UK", "Berlin, DE", "Bangalore, IN"]
+    skills_pool = [
+        "Python", "TensorFlow", "PyTorch", "Scikit-learn", "SQL", "AWS", "Azure", "GCP",
+        "Docker", "Kubernetes", "Spark", "Kafka", "NLP", "Computer Vision", "Reinforcement Learning",
+        "C++", "Java", "R", "Git", "Agile", "Communication", "Problem-solving", "Leadership",
+        "HuggingFace", "Pandas", "NumPy", "MLOps", "Data Warehousing", "Big Data"
+    ]
+    salary_ranges = [
+        (80000, 120000), (100000, 150000), (120000, 180000), (150000, 220000), (90000, 130000)
+    ]
+
+    for _ in range(num_listings):
+        job_title = random.choice(job_titles)
+        company = random.choice(companies)
+        location = random.choice(locations)
+        posted_date = start_date + datetime.timedelta(
+            days=random.randint(0, days_of_data - 1),
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59)
+        )
+        min_salary, max_salary = random.choice(salary_ranges)
+
+        # Generate a description with some random skills
+        num_skills = random.randint(5, 15)
+        random_skills = random.sample(skills_pool, num_skills)
+        description = f"We are looking for a talented {job_title} to join our team. Responsibilities include building and deploying ML models. Experience with {', '.join(random_skills[:num_skills//2])} is a plus. Required skills: {', '.join(random_skills[num_skills//2:])}. Salary: ${min_salary}-${max_salary} annually. Benefits include health insurance and paid time off."
+
+        job_data.append({
+            'job_title': job_title,
+            'company': company,
+            'location': location,
+            'posted_date': posted_date,
+            'description': description,
+            'salary_text': f"${min_salary}-{max_salary}", # Raw text for parsing simulation
+            'source_url': f"http://example.com/job/{str(uuid.uuid4())[:8]}"
+        })
+    df = pd.DataFrame(job_data)
+    df['posted_date'] = pd.to_datetime(df['posted_date'])
+    print(f"Extracted {len(df)} raw job records.")
+    return df
+
+# --- Data Transformation ---
+def transform_job_data(df_raw_jobs: pd.DataFrame):
+    """
+    Transforms raw job data: cleans, extracts features, normalizes, and deduplicates.
+    """
+    print("Starting job data transformation...")
+    if df_raw_jobs.empty:
+        print("Raw job data is empty, skipping transformation.")
+        return pd.DataFrame()
+
+    df_transformed = df_raw_jobs.copy()
+
+    # 1. Role Categorization
+    def categorize_role(title):
+        title_lower = title.lower()
+        if "machine learning engineer" in title_lower or "ml engineer" in title_lower:
+            return "ML Engineer"
+        if "data scientist" in title_lower:
+            return "Data Scientist"
+        if "ai researcher" in title_lower or "ai scientist" in title_lower:
+            return "AI Researcher"
+        if "nlp engineer" in title_lower:
+            return "NLP Engineer"
+        if "computer vision" in title_lower:
+            return "Computer Vision Engineer"
+        if "deep learning" in title_lower:
+            return "Deep Learning Engineer"
+        if "applied scientist" in title_lower:
+            return "Applied Scientist"
+        if "mlops" in title_lower:
+            return "MLOps Engineer"
+        if "data engineer" in title_lower and ("ml" in title_lower or "machine learning" in title_lower):
+            return "Data Engineer (ML Focus)"
+        if "ai product manager" in title_lower:
+            return "AI Product Manager"
+        if "quantitative researcher" in title_lower or "quant" in title_lower:
+            return "Quantitative Researcher (AI)"
+        return "Other AI/ML Role"
+    df_transformed['role_category'] = df_transformed['job_title'].apply(categorize_role)
+
+    # 2. Salary Extraction & Normalization (to USD annual)
+    # This is a simplified regex for $X-Y or $X,XXX-Y,YYY
+    def parse_salary(salary_text):
+        min_sal, max_sal = None, None
+        if salary_text:
+            # Remove commas and $ sign
+            cleaned_text = salary_text.replace(',', '').replace('$', '')
+            # Regex to find numbers that look like salary ranges
+            match = re.search(r'(\d+)-(\d+)', cleaned_text)
+            if match:
+                min_sal = float(match.group(1))
+                max_sal = float(match.group(2))
+            else: # Try single number
+                single_match = re.search(r'(\d+)', cleaned_text)
+                if single_match:
+                    min_sal = float(single_match.group(1))
+                    max_sal = float(single_match.group(1)) # Assume single value is both min/max
+
+            # Basic scaling for hourly/monthly if implied (very simplified)
+            # In a real system, you'd need more sophisticated NLP for "per hour", "per month"
+            if min_sal and min_sal < 1000: # Likely hourly
+                min_sal *= 2080 # 40 hours/week * 52 weeks
+                if max_sal: max_sal *= 2080
+            elif min_sal and min_sal < 10000: # Likely monthly
+                min_sal *= 12
+                if max_sal: max_sal *= 12
+        return min_sal, max_sal
+
+    df_transformed[['min_salary_usd', 'max_salary_usd']] = df_transformed['salary_text'].apply(lambda x: pd.Series(parse_salary(x)))
+
+    # 3. Skill Extraction
+    # Define a comprehensive list of skills to look for
+    skills_keywords = {
+        "Python": ["python"], "TensorFlow": ["tensorflow", "tf"], "PyTorch": ["pytorch", "torch"],
+        "Scikit-learn": ["scikit-learn", "sklearn"], "SQL": ["sql", "postgresql", "mysql", "sqlite"],
+        "AWS": ["aws", "amazon web services"], "Azure": ["azure", "microsoft azure"], "GCP": ["gcp", "google cloud"],
+        "Docker": ["docker"], "Kubernetes": ["kubernetes", "k8s"], "Spark": ["spark", "apache spark"],
+        "Kafka": ["kafka", "apache kafka"], "NLP": ["nlp", "natural language processing", "spacy", "nltk", "huggingface"],
+        "Computer Vision": ["computer vision", "cv", "opencv"], "Reinforcement Learning": ["reinforcement learning", "rl"],
+        "C++": ["c++", "cpp"], "Java": ["java"], "R": ["r programming"], "Git": ["git"], "Agile": ["agile", "scrum"],
+        "Communication": ["communication"], "Problem-solving": ["problem-solving", "problem solving"],
+        "Leadership": ["leadership"], "Pandas": ["pandas"], "NumPy": ["numpy"], "MLOps": ["mlops"],
+        "Data Warehousing": ["data warehousing", "data warehouse"], "Big Data": ["big data", "hadoop"]
+    }
+
+    def extract_skills(description, title):
+        found_skills = set()
+        text = (description or "") + " " + (title or "")
+        text_lower = text.lower()
+        for skill, keywords in skills_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                found_skills.add(skill)
+        return ", ".join(sorted(list(found_skills)))
+
+    df_transformed['extracted_skills'] = df_transformed.apply(
+        lambda row: extract_skills(row['description'], row['job_title']), axis=1
+    )
+
+    # 4. Location Normalization (simplified)
+    def normalize_location(loc):
+        loc_lower = loc.lower()
+        if "new york" in loc_lower or "ny" in loc_lower: return "New York, NY"
+        if "san francisco" in loc_lower or "sf" in loc_lower: return "San Francisco, CA"
+        if "seattle" in loc_lower: return "Seattle, WA"
+        if "london" in loc_lower: return "London, UK"
+        if "bangalore" in loc_lower: return "Bangalore, IN"
+        return loc # Return original if not matched
+    df_transformed['location'] = df_transformed['location'].apply(normalize_location)
+
+    # 5. Deduplication (simple: based on job title, company, and location)
+    # In a real system, you might use hashing of description or a more robust method.
+    df_transformed.drop_duplicates(subset=['job_title', 'company', 'location'], keep='first', inplace=True)
+
+    # Select and reorder columns for the database model
+    final_df = df_transformed[[
+        'job_title', 'company', 'location', 'posted_date', 'description',
+        'min_salary_usd', 'max_salary_usd', 'extracted_skills', 'role_category', 'source_url'
+    ]]
+    print(f"Transformation complete. Resulting DataFrame has {len(final_df)} unique records.")
+    return final_df
+
+# --- Data Loading ---
+def load_job_data_to_db(df_jobs: pd.DataFrame, db_session_factory):
+    """
+    Loads the transformed job data into the database.
+    """
+    if df_jobs.empty:
+        print("No job data to load to database.")
+        return
+
+    print(f"Loading {len(df_jobs)} job records into the database...")
+    with db_session_factory() as db:
+        for index, row in df_jobs.iterrows():
+            # Check for existing entry to avoid duplicates if running multiple times
+            # A more robust check might involve hashing title+company+location+posted_date
+            existing_entry = db.query(JobPosting).filter_by(
+                job_title=row['job_title'],
+                company=row['company'],
+                location=row['location']
+            ).first()
+            if not existing_entry:
+                job_entry = JobPosting(
+                    job_title=row['job_title'],
+                    company=row['company'],
+                    location=row['location'],
+                    posted_date=row['posted_date'],
+                    description=row['description'],
+                    min_salary_usd=row['min_salary_usd'],
+                    max_salary_usd=row['max_salary_usd'],
+                    extracted_skills=row['extracted_skills'],
+                    role_category=row['role_category'],
+                    source_url=row['source_url']
+                )
+                db.add(job_entry)
+        try:
+            db.commit()
+            print("Job data loaded successfully.")
+        except IntegrityError as e:
+            db.rollback()
+            print(f"Database error (possible duplicate or constraint violation): {e}")
+            print("Consider adding a unique constraint to the table for (job_title, company, location) and handling upserts.")
+        except Exception as e:
+            db.rollback()
+            print(f"An unexpected error occurred during database load: {e}")
+
+# --- Analysis and Visualization ---
+def analyze_and_visualize_trends(db_session_factory):
+    """
+    Fetches job data from the database and generates trend visualizations.
+    """
+    print("\n--- Generating AI Job Trend Visualizations ---")
+
+    with db_session_factory() as db:
+        # Fetch all job postings
+        all_job_records = db.query(JobPosting).all()
+        if not all_job_records:
+            print("No job posting data found for visualization.")
+            return
+
+        df_jobs = pd.DataFrame([{
+            'job_title': rec.job_title,
+            'company': rec.company,
+            'location': rec.location,
+            'posted_date': rec.posted_date,
+            'min_salary_usd': rec.min_salary_usd,
+            'max_salary_usd': rec.max_salary_usd,
+            'extracted_skills': rec.extracted_skills,
+            'role_category': rec.role_category
+        } for rec in all_job_records])
+
+    if df_jobs.empty:
+        print("No data to visualize.")
+        return
+
+    df_jobs['posted_date'] = pd.to_datetime(df_jobs['posted_date'])
+
+    # Plot 1: Number of Jobs by Role Category
+    plt.figure(figsize=(12, 7))
+    sns.countplot(y='role_category', data=df_jobs, order=df_jobs['role_category'].value_counts().index, palette='viridis')
+    plt.title('Number of AI/ML Jobs by Role Category')
+    plt.xlabel('Number of Job Postings')
+    plt.ylabel('Role Category')
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: Average Salary by Role Category
+    avg_salary_by_role = df_jobs.groupby('role_category')[['min_salary_usd', 'max_salary_usd']].mean().reset_index()
+    avg_salary_by_role['avg_salary'] = (avg_salary_by_role['min_salary_usd'] + avg_salary_by_role['max_salary_usd']) / 2
+    avg_salary_by_role = avg_salary_by_role.sort_values('avg_salary', ascending=False)
+
+    plt.figure(figsize=(12, 7))
+    sns.barplot(x='avg_salary', y='role_category', data=avg_salary_by_role, palette='magma')
+    plt.title('Average Annual Salary (USD) by AI/ML Role Category')
+    plt.xlabel('Average Salary (USD)')
+    plt.ylabel('Role Category')
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 3: Top N Most Demanded Skills
+    all_skills = []
+    for skills_str in df_jobs['extracted_skills'].dropna():
+        all_skills.extend([s.strip() for s in skills_str.split(',') if s.strip()])
+    skill_counts = Counter(all_skills)
+    top_n_skills = pd.DataFrame(skill_counts.most_common(15), columns=['Skill', 'Count'])
+
+    if not top_n_skills.empty:
+        plt.figure(figsize=(12, 7))
+        sns.barplot(x='Count', y='Skill', data=top_n_skills, palette='cividis')
+        plt.title('Top 15 Most Demanded AI/ML Skills')
+        plt.xlabel('Number of Job Postings Mentioning Skill')
+        plt.ylabel('Skill')
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("No skills extracted for visualization.")
+
+
+    # Plot 4: Number of Jobs by Location
+    plt.figure(figsize=(12, 7))
+    sns.countplot(y='location', data=df_jobs, order=df_jobs['location'].value_counts().index, palette='plasma')
+    plt.title('Number of AI/ML Jobs by Location')
+    plt.xlabel('Number of Job Postings')
+    plt.ylabel('Location')
+    plt.tight_layout()
+    plt.show()
+
+    print("AI Job Trend visualizations generated.")
+    print("For interactive dashboards, consider connecting to Google Data Studio or Streamlit.")
+
+# --- Main ETL Pipeline Execution ---
+if __name__ == "__main__":
+    print("--- Running AI Job Trends Scraper + ETL System ---")
+
+    # 1. Extract (Simulated)
+    raw_job_listings_df = simulate_job_listings(NUM_JOB_LISTINGS, DAYS_OF_DATA)
+
+    # 2. Transform
+    transformed_jobs_df = transform_job_data(raw_job_listings_df)
+
+    # 3. Load
+    load_job_data_to_db(transformed_jobs_df, SessionLocal)
+
+    # --- Analysis and Visualization ---
+    analyze_and_visualize_trends(SessionLocal)
+
+    print("\nAI Job Trends Scraper + ETL System pipeline completed.")
+    print(f"Data stored in '{DATABASE_URL.split('///')[-1]}'.")
+    print("\nTo integrate with Airflow, you would define these steps (Extract, Transform, Load, Analyze) as separate tasks in a DAG.")
+    print("For dashboarding, connect your BI tool (e.g., Google Data Studio, Tableau) to the SQLite database.")
+
