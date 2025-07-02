@@ -1,0 +1,235 @@
+import paho.mqtt.client as mqtt
+import json
+import datetime
+import time
+import threading
+import collections
+import random
+import uuid # For unique device IDs
+
+# InfluxDB Client library
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+# --- Configuration ---
+# MQTT Broker Settings
+MQTT_BROKER_HOST = "localhost"
+MQTT_BROKER_PORT = 1883
+MQTT_TOPIC = "iiot/sensor/data" # Topic where sensor data will be published
+
+# InfluxDB Settings
+# IMPORTANT: Replace with your InfluxDB URL, Token, Org, and Bucket
+# If running InfluxDB locally, default URL is usually http://localhost:8086
+INFLUXDB_URL = "http://localhost:8086"
+INFLUXDB_TOKEN = "YOUR_INFLUXDB_TOKEN" # e.g., "my-super-secret-auth-token"
+INFLUXDB_ORG = "your_organization" # e.g., "my_org"
+INFLUXDB_BUCKET = "iiot_sensor_data" # e.g., "industrial_sensors"
+
+# Sensor Simulation Settings
+NUM_DEVICES = 3
+SIMULATION_INTERVAL_SECONDS = 1 # How often each device sends data
+ROLLING_AVERAGE_WINDOW_SIZE = 10 # Number of data points for rolling average
+ANOMALY_THRESHOLD_MULTIPLIER = 2.0 # How many std devs away for anomaly
+
+# In-memory storage for rolling average calculation (deque for efficient appends/pops)
+# Structure: { (device_id, sensor_type): collections.deque([values]) }
+sensor_data_buffers = collections.defaultdict(lambda: collections.deque(maxlen=ROLLING_AVERAGE_WINDOW_SIZE))
+
+# --- InfluxDB Client Setup ---
+client = None # Global client to be initialized
+write_api = None
+query_api = None
+
+def init_influxdb_client():
+    """Initializes the InfluxDB client and APIs."""
+    global client, write_api, query_api
+    try:
+        client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+        write_api = client.write_api(write_options=SYNCHRONOUS)
+        query_api = client.query_api()
+        print("InfluxDB client initialized.")
+    except Exception as e:
+        print(f"Error initializing InfluxDB client: {e}")
+        client = None # Ensure client is None on failure
+
+def check_and_create_influxdb_bucket():
+    """Checks if the bucket exists and creates it if not."""
+    if not client:
+        print("InfluxDB client not initialized. Cannot check/create bucket.")
+        return False
+    try:
+        buckets_api = client.buckets_api()
+        bucket = buckets_api.find_bucket_by_name(INFLUXDB_BUCKET)
+        if not bucket:
+            print(f"Bucket '{INFLUXDB_BUCKET}' not found. Creating it...")
+            buckets_api.create_bucket(bucket_name=INFLUXDB_BUCKET, org=INFLUXDB_ORG)
+            print(f"Bucket '{INFLUXDB_BUCKET}' created successfully.")
+        else:
+            print(f"Bucket '{INFLUXDB_BUCKET}' already exists.")
+        return True
+    except Exception as e:
+        print(f"Error checking/creating InfluxDB bucket: {e}")
+        return False
+
+# --- MQTT Callbacks ---
+def on_connect(client, userdata, flags, rc):
+    """Callback function for when the MQTT client connects to the broker."""
+    if rc == 0:
+        print(f"Connected to MQTT Broker: {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
+        client.subscribe(MQTT_TOPIC)
+        print(f"Subscribed to topic: {MQTT_TOPIC}")
+    else:
+        print(f"Failed to connect to MQTT Broker, return code {rc}\n")
+
+def on_message(client, userdata, msg):
+    """
+    Callback function for when a message is received from the MQTT broker.
+    This is where the ETL (Transform and Load) logic resides.
+    """
+    try:
+        payload = msg.payload.decode('utf-8')
+        sensor_data = json.loads(payload)
+
+        device_id = sensor_data.get("device_id")
+        sensor_type = sensor_data.get("sensor_type")
+        value = sensor_data.get("value")
+        timestamp_str = sensor_data.get("timestamp") # ISO format string
+
+        if not all([device_id, sensor_type, value is not None, timestamp_str]):
+            print(f"Skipping malformed message: {sensor_data}")
+            return
+
+        # Convert timestamp string to datetime object (assuming ISO format from simulator)
+        timestamp = datetime.datetime.fromisoformat(timestamp_str)
+
+        print(f"Received: Device '{device_id}', Sensor '{sensor_type}', Value: {value:.2f}, Time: {timestamp.strftime('%H:%M:%S')}")
+
+        # --- Transformation: Calculate Rolling Average and Detect Anomaly ---
+        sensor_key = (device_id, sensor_type)
+        current_buffer = sensor_data_buffers[sensor_key]
+        current_buffer.append(value)
+
+        rolling_avg = np.mean(list(current_buffer))
+        is_anomaly = False
+        if len(current_buffer) == ROLLING_AVERAGE_WINDOW_SIZE:
+            std_dev = np.std(list(current_buffer))
+            if std_dev > 0 and abs(value - rolling_avg) > ANOMALY_THRESHOLD_MULTIPLIER * std_dev:
+                is_anomaly = True
+                print(f"!!! ANOMALY DETECTED for {device_id}/{sensor_type}: Value {value:.2f} vs Avg {rolling_avg:.2f} (StdDev {std_dev:.2f})")
+
+        # --- Load: Write to InfluxDB ---
+        if write_api:
+            try:
+                point = (
+                    Point(sensor_type) # Measurement name (e.g., "temperature", "vibration")
+                    .tag("device_id", device_id)
+                    .tag("sensor_type", sensor_type)
+                    .field("value", value)
+                    .field("rolling_avg", rolling_avg)
+                    .field("is_anomaly", is_anomaly)
+                    .time(timestamp) # Use the original timestamp from the sensor
+                )
+                write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+                # print(f"Wrote data to InfluxDB for {device_id}/{sensor_type}")
+            except Exception as e:
+                print(f"Error writing to InfluxDB: {e}")
+        else:
+            print("InfluxDB write API not initialized. Data not written.")
+
+    except json.JSONDecodeError:
+        print(f"Failed to decode JSON from message: {msg.payload.decode('utf-8')}")
+    except Exception as e:
+        print(f"Error processing MQTT message: {e}")
+
+# --- Sensor Data Simulator ---
+def simulate_sensor_data(mqtt_client, num_devices: int, interval: int):
+    """
+    Simulates multiple IIoT devices sending sensor data to the MQTT broker.
+    """
+    device_ids = [f"device_{str(uuid.uuid4())[:8]}" for _ in range(num_devices)]
+    sensor_types = ["temperature", "vibration", "pressure"] # Example sensor types
+
+    # Initial values for simulation
+    current_values = {
+        (dev_id, s_type): random.uniform(20.0, 30.0) if s_type == "temperature" else random.uniform(10.0, 20.0)
+        for dev_id in device_ids for s_type in sensor_types
+    }
+
+    print(f"\nStarting sensor data simulation for {num_devices} devices...")
+    while True:
+        for device_id in device_ids:
+            for sensor_type in sensor_types:
+                # Simulate value fluctuation
+                current_val = current_values[(device_id, sensor_type)]
+                change = random.uniform(-1.0, 1.0)
+                # Introduce occasional spikes/drops to simulate anomalies
+                if random.random() < 0.05: # 5% chance of a larger spike/drop
+                    change += random.uniform(-5.0, 5.0)
+
+                new_val = max(0.0, current_val + change) # Ensure value doesn't go below 0
+                current_values[(device_id, sensor_type)] = new_val
+
+                data = {
+                    "device_id": device_id,
+                    "sensor_type": sensor_type,
+                    "value": round(new_val, 2),
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z" # ISO 8601 with Z for UTC
+                }
+                payload = json.dumps(data)
+                mqtt_client.publish(MQTT_TOPIC, payload)
+                # print(f"Published: {device_id}/{sensor_type} -> {new_val:.2f}")
+        time.sleep(interval)
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Check InfluxDB token
+    if INFLUXDB_TOKEN == "YOUR_INFLUXDB_TOKEN":
+        print("ERROR: Please replace 'YOUR_INFLUXDB_TOKEN' with your actual InfluxDB token.")
+        print("Also update INFLUXDB_ORG and INFLUXDB_URL if they are not defaults.")
+        exit()
+
+    # 1. Initialize InfluxDB Client and check/create bucket
+    init_influxdb_client()
+    if not check_and_create_influxdb_bucket():
+        print("Could not connect to InfluxDB or create bucket. Exiting.")
+        exit()
+
+    # 2. Setup MQTT Client
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1) # Specify API version
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+
+    try:
+        mqtt_client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
+    except ConnectionRefusedError:
+        print(f"Connection to MQTT broker refused. Is Mosquitto running on {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}?")
+        exit()
+    except Exception as e:
+        print(f"Could not connect to MQTT broker: {e}")
+        exit()
+
+    # Start MQTT loop in a non-blocking way
+    mqtt_client.loop_start()
+
+    # 3. Start Sensor Data Simulator in a separate thread
+    simulator_thread = threading.Thread(target=simulate_sensor_data, args=(mqtt_client, NUM_DEVICES, SIMULATION_INTERVAL_SECONDS))
+    simulator_thread.daemon = True # Daemon threads exit when the main program exits
+    simulator_thread.start()
+
+    print("\nIndustrial IoT Data ETL Pipeline is running. Press Ctrl+C to stop.")
+    print(f"Data is being published to MQTT topic '{MQTT_TOPIC}' and loaded into InfluxDB bucket '{INFLUXDB_BUCKET}'.")
+    print("Open Grafana and connect to InfluxDB to visualize the data.")
+
+    try:
+        # Keep the main thread alive to allow MQTT and simulator threads to run
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping pipeline...")
+    finally:
+        mqtt_client.loop_stop() # Stop the MQTT loop
+        mqtt_client.disconnect() # Disconnect from MQTT broker
+        if client:
+            client.close() # Close InfluxDB client
+        print("Pipeline stopped gracefully.")
+
