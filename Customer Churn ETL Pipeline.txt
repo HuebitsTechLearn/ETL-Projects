@@ -1,0 +1,234 @@
+import pandas as pd
+import datetime
+import random
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import uuid # For generating unique IDs
+
+# --- Configuration ---
+# For demonstration, we'll use SQLite, which creates a file-based database.
+# To use MySQL, change this to: "mysql+mysqlconnector://user:password@host:port/database_name"
+# Ensure you have 'mysql-connector-python' installed if using MySQL.
+DATABASE_URL = "sqlite:///./saas_churn_analytics.db"
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the CustomerHealthMetric model
+class CustomerHealthMetric(Base):
+    __tablename__ = "customer_health_metrics"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, index=True, nullable=False)
+    # Use UTC for timestamps
+    snapshot_date = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    login_frequency_7d = Column(Integer, default=0)
+    feature_a_usage_7d = Column(Integer, default=0)
+    feature_b_usage_7d = Column(Integer, default=0)
+    time_in_app_minutes_7d = Column(Float, default=0.0)
+    last_active_date = Column(DateTime)
+    is_churned = Column(Boolean, default=False) # Simplified churn status for demonstration
+
+    def __repr__(self):
+        return (f"<CustomerHealthMetric(user_id='{self.user_id}', "
+                f"snapshot_date='{self.snapshot_date.strftime('%Y-%m-%d')}', "
+                f"login_freq_7d={self.login_frequency_7d})>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Simulated Data Extraction ---
+def extract_user_activity_data(num_users=100, days_of_data=30):
+    """
+    Simulates extracting raw user activity data from application logs.
+    Generates data for a specified number of users over a period of days.
+    """
+    print(f"Extracting {days_of_data} days of simulated user activity data for {num_users} users...")
+    activity_data = []
+    end_date = datetime.datetime.now(datetime.timezone.utc)
+    start_date = end_date - datetime.timedelta(days=days_of_data)
+
+    user_ids = [f"user_{str(uuid.uuid4())[:8]}" for _ in range(num_users)]
+
+    for user_id in user_ids:
+        # Simulate some users being more active than others
+        avg_logins_per_day = random.randint(1, 10)
+        avg_feature_a_usage = random.randint(0, 5)
+        avg_feature_b_usage = random.randint(0, 5)
+        avg_time_in_app = random.randint(10, 120) # minutes
+
+        for i in range(days_of_data):
+            current_date = start_date + datetime.timedelta(days=i)
+            # Simulate activity on some days, not all
+            if random.random() < 0.8: # 80% chance of activity on a given day
+                num_logins = max(1, int(random.gauss(avg_logins_per_day, 2)))
+                for _ in range(num_logins):
+                    # Simulate activity throughout the day
+                    activity_time = current_date + datetime.timedelta(
+                        hours=random.randint(0, 23),
+                        minutes=random.randint(0, 59),
+                        seconds=random.randint(0, 59)
+                    )
+                    activity_data.append({
+                        'user_id': user_id,
+                        'event_type': 'login',
+                        'timestamp': activity_time,
+                        'feature_a_clicks': 0,
+                        'feature_b_clicks': 0,
+                        'session_duration_minutes': 0
+                    })
+
+                # Simulate feature usage and session duration
+                if random.random() < 0.9: # 90% chance of feature usage if logged in
+                    feature_a_clicks = max(0, int(random.gauss(avg_feature_a_usage, 1)))
+                    feature_b_clicks = max(0, int(random.gauss(avg_feature_b_usage, 1)))
+                    session_duration = max(1, int(random.gauss(avg_time_in_app, 15)))
+
+                    activity_data.append({
+                        'user_id': user_id,
+                        'event_type': 'feature_usage',
+                        'timestamp': activity_time, # Use same timestamp as last login for simplicity
+                        'feature_a_clicks': feature_a_clicks,
+                        'feature_b_clicks': feature_b_clicks,
+                        'session_duration_minutes': session_duration
+                    })
+
+    df = pd.DataFrame(activity_data)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    print(f"Extracted {len(df)} raw activity records.")
+    return df
+
+# --- Transformation Logic ---
+def transform_activity_to_kpis(df_activity: pd.DataFrame, snapshot_date: datetime.datetime):
+    """
+    Transforms raw user activity data into aggregated customer health KPIs.
+    Calculates metrics for the last 7 days relative to the snapshot_date.
+    """
+    print(f"Transforming activity data for snapshot date: {snapshot_date.strftime('%Y-%m-%d')}")
+
+    # Filter data for the last 7 days relative to the snapshot_date
+    seven_days_ago = snapshot_date - datetime.timedelta(days=7)
+    recent_activity = df_activity[
+        (df_activity['timestamp'] >= seven_days_ago) &
+        (df_activity['timestamp'] < snapshot_date) # Exclude events on snapshot_date itself if it's current day
+    ].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+    if recent_activity.empty:
+        print("No recent activity found for transformation.")
+        return pd.DataFrame()
+
+    # Aggregate metrics per user
+    transformed_data = []
+    for user_id, user_df in recent_activity.groupby('user_id'):
+        login_frequency_7d = user_df[user_df['event_type'] == 'login'].shape[0]
+        feature_a_usage_7d = user_df['feature_a_clicks'].sum()
+        feature_b_usage_7d = user_df['feature_b_clicks'].sum()
+        time_in_app_minutes_7d = user_df['session_duration_minutes'].sum()
+
+        # Last active date for the user (overall, not just last 7 days)
+        # We need to look at the entire df_activity for this
+        last_active_timestamp = df_activity[df_activity['user_id'] == user_id]['timestamp'].max()
+
+        # Simple churn logic: if no activity in the last 7 days, consider as potentially churned
+        # This is a very basic heuristic; real churn models are more complex.
+        is_churned = (last_active_timestamp < seven_days_ago) if last_active_timestamp else True
+
+        transformed_data.append({
+            'user_id': user_id,
+            'snapshot_date': snapshot_date,
+            'login_frequency_7d': int(login_frequency_7d),
+            'feature_a_usage_7d': int(feature_a_usage_7d),
+            'feature_b_usage_7d': int(feature_b_usage_7d),
+            'time_in_app_minutes_7d': float(time_in_app_minutes_7d),
+            'last_active_date': last_active_timestamp,
+            'is_churned': bool(is_churned)
+        })
+
+    df_transformed = pd.DataFrame(transformed_data)
+    print(f"Transformed {len(df_transformed)} customer health records.")
+    return df_transformed
+
+# --- Loading Data ---
+def load_kpis_to_database(df_kpis: pd.DataFrame, db_session_factory):
+    """
+    Loads the transformed KPI data into the PostgreSQL/MySQL database.
+    """
+    if df_kpis.empty:
+        print("No KPIs to load to the database.")
+        return
+
+    print(f"Loading {len(df_kpis)} KPI records into the database...")
+    with db_session_factory() as db:
+        for index, row in df_kpis.iterrows():
+            # Create a new CustomerHealthMetric object for each row
+            metric = CustomerHealthMetric(
+                user_id=row['user_id'],
+                snapshot_date=row['snapshot_date'],
+                login_frequency_7d=row['login_frequency_7d'],
+                feature_a_usage_7d=row['feature_a_usage_7d'],
+                feature_b_usage_7d=row['feature_b_usage_7d'],
+                time_in_app_minutes_7d=row['time_in_app_minutes_7d'],
+                last_active_date=row['last_active_date'],
+                is_churned=row['is_churned']
+            )
+            db.add(metric)
+        db.commit()
+    print("KPIs loaded successfully.")
+
+# --- Simulated Airflow DAG (Main ETL Pipeline) ---
+def run_churn_etl_pipeline(snapshot_date: datetime.datetime):
+    """
+    Simulates the daily execution of the customer churn ETL pipeline.
+    This function acts as the main task in a conceptual Airflow DAG.
+    """
+    print(f"\n--- Running Churn ETL Pipeline for {snapshot_date.strftime('%Y-%m-%d')} ---")
+
+    # Task 1: Extract
+    # For a real pipeline, this would fetch data from actual logs/databases
+    raw_activity_df = extract_user_activity_data(num_users=150, days_of_data=45) # Get more historical data for better analysis
+
+    # Task 2: Transform
+    # Pass the full raw_activity_df to ensure last_active_date can be calculated correctly
+    kpis_df = transform_activity_to_kpis(raw_activity_df, snapshot_date)
+
+    # Task 3: Load
+    load_kpis_to_database(kpis_df, SessionLocal)
+
+    print(f"--- Churn ETL Pipeline for {snapshot_date.strftime('%Y-%m-%d')} Completed ---")
+
+# --- Example Usage (Run the pipeline) ---
+if __name__ == "__main__":
+    # You can run this script daily, typically orchestrated by Airflow.
+    # For demonstration, let's run it for today's data.
+    today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    run_churn_etl_pipeline(today)
+
+    # You can also query the database to see the results
+    print("\n--- Querying recent customer health metrics from the database ---")
+    with SessionLocal() as db:
+        # Fetch the latest metrics for a few users
+        recent_metrics = db.query(CustomerHealthMetric).filter(
+            CustomerHealthMetric.snapshot_date == today
+        ).limit(5).all()
+
+        if recent_metrics:
+            for metric in recent_metrics:
+                print(metric)
+        else:
+            print("No metrics found for today's snapshot date. Run the pipeline first.")
+
+    print("\n--- Example: Fetching all churned users from the database ---")
+    with SessionLocal() as db:
+        churned_users = db.query(CustomerHealthMetric).filter(
+            CustomerHealthMetric.is_churned == True
+        ).all()
+        if churned_users:
+            print(f"Found {len(churned_users)} potentially churned users:")
+            for user in churned_users[:5]: # Print first 5
+                print(f"User ID: {user.user_id}, Last Active: {user.last_active_date.strftime('%Y-%m-%d %H:%M') if user.last_active_date else 'N/A'}")
+        else:
+            print("No churned users identified in the current data.")
