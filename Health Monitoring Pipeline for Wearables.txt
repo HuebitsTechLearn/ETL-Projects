@@ -1,0 +1,346 @@
+import pandas as pd
+import datetime
+import random
+import uuid # For generating unique IDs
+import numpy as np
+import time
+import threading
+
+# SQLAlchemy for database interaction
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Float, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
+
+# Matplotlib and Seaborn for visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# Using SQLite for simplicity.
+# For InfluxDB, you'd use 'influxdb_client' library and specific connection details.
+# For DynamoDB, you'd use 'boto3' library.
+DATABASE_URL = "sqlite:///./wearable_health_data.db"
+
+# Number of simulated wearable devices
+NUM_DEVICES = 3
+# How often each device sends data (in seconds)
+SIMULATION_INTERVAL_SECONDS = 1
+# Number of data points for rolling average calculation
+ROLLING_AVERAGE_WINDOW_SIZE = 60 # e.g., 60 seconds of data for 1-minute rolling avg
+# Anomaly detection: how many standard deviations from rolling average to flag
+ANOMALY_THRESHOLD_STD_DEV = 2.5
+
+# In-memory storage for rolling average calculation (deque for efficient appends/pops)
+# Structure: { (device_id, metric_type): collections.deque([values]) }
+metric_data_buffers = collections.defaultdict(lambda: collections.deque(maxlen=ROLLING_AVERAGE_WINDOW_SIZE))
+
+# --- Database Setup (SQLAlchemy) ---
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+
+# Define the BiometricRecord model
+class BiometricRecord(Base):
+    __tablename__ = "biometric_records"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = Column(String, nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True) # UTC timestamp
+    heart_rate_bpm = Column(Integer)
+    spo2_percent = Column(Float)
+    skin_temperature_celsius = Column(Float)
+    steps_count = Column(Integer) # Steps in the last interval
+
+    # Derived/Transformed Metrics
+    heart_rate_rolling_avg = Column(Float)
+    spo2_rolling_avg = Column(Float)
+    temp_rolling_avg = Column(Float)
+    is_hr_anomaly = Column(Boolean, default=False)
+    is_spo2_anomaly = Column(Boolean, default=False)
+    is_temp_anomaly = Column(Boolean, default=False)
+    activity_level = Column(String) # e.g., 'sedentary', 'light', 'moderate', 'active'
+
+    def __repr__(self):
+        return (f"<BiometricRecord(device='{self.device_id}', time='{self.timestamp.strftime('%H:%M:%S')}', "
+                f"HR={self.heart_rate_bpm}, SpO2={self.spo2_percent}, Anomaly_HR={self.is_hr_anomaly})>")
+
+# Create tables in the database if they don't exist
+Base.metadata.create_all(engine)
+
+# Create a session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# --- Simulated Data Extraction ---
+def simulate_wearable_data(device_id: str, interval: int):
+    """
+    Simulates a single wearable device sending biometric data.
+    """
+    print(f"Starting simulation for Device: {device_id}...")
+    # Initial values for simulation
+    current_hr = random.randint(60, 90)
+    current_spo2 = random.uniform(95.0, 99.9)
+    current_temp = random.uniform(36.0, 37.5) # Celsius
+    current_steps = 0
+
+    while True:
+        timestamp = datetime.datetime.utcnow()
+
+        # Simulate heart rate fluctuation (normal range)
+        hr_change = random.randint(-5, 5)
+        current_hr = max(40, min(180, current_hr + hr_change)) # Keep within reasonable bounds
+
+        # Introduce occasional HR spikes (simulated anomaly)
+        if random.random() < 0.02: # 2% chance of a spike
+            current_hr += random.randint(20, 50)
+            current_hr = min(220, current_hr) # Cap max HR
+
+        # Simulate SpO2 fluctuation
+        spo2_change = random.uniform(-0.5, 0.5)
+        current_spo2 = max(85.0, min(100.0, current_spo2 + spo2_change))
+
+        # Introduce occasional SpO2 drops
+        if random.random() < 0.01: # 1% chance of a drop
+            current_spo2 -= random.uniform(2.0, 5.0)
+            current_spo2 = max(80.0, current_spo2) # Cap min SpO2
+
+        # Simulate skin temperature fluctuation
+        temp_change = random.uniform(-0.1, 0.1)
+        current_temp = max(35.0, min(40.0, current_temp + temp_change))
+
+        # Simulate steps (activity)
+        steps_this_interval = random.randint(0, 100) # Steps in this second/interval
+        if random.random() < 0.1: # 10% chance of higher activity
+            steps_this_interval = random.randint(100, 500)
+        current_steps = steps_this_interval
+
+        raw_data = {
+            "device_id": device_id,
+            "timestamp": timestamp,
+            "heart_rate_bpm": current_hr,
+            "spo2_percent": round(current_spo2, 1),
+            "skin_temperature_celsius": round(current_temp, 2),
+            "steps_count": current_steps
+        }
+        # print(f"Simulated: {device_id} HR:{current_hr} SpO2:{current_spo2:.1f} Temp:{current_temp:.2f} Steps:{current_steps}")
+        process_biometric_data(raw_data)
+        time.sleep(interval)
+
+# --- Data Transformation and Loading ---
+def process_biometric_data(raw_biometric_data: dict):
+    """
+    Performs real-time transformation and loads data into the database.
+    This function acts as the "Lambda function" in a serverless architecture.
+    """
+    device_id = raw_biometric_data['device_id']
+    timestamp = raw_biometric_data['timestamp']
+
+    # --- Transformation Step 1: Rolling Averages and Anomaly Detection ---
+    derived_metrics = {}
+    is_anomaly_flags = {}
+
+    for metric_name, value in [
+        ('heart_rate_bpm', raw_biometric_data['heart_rate_bpm']),
+        ('spo2_percent', raw_biometric_data['spo2_percent']),
+        ('skin_temperature_celsius', raw_biometric_data['skin_temperature_celsius'])
+    ]:
+        buffer_key = (device_id, metric_name)
+        current_buffer = metric_data_buffers[buffer_key]
+        current_buffer.append(value)
+
+        rolling_avg = np.mean(list(current_buffer))
+        derived_metrics[f"{metric_name.replace('_bpm', '').replace('_percent', '').replace('_celsius', '')}_rolling_avg"] = round(rolling_avg, 2)
+
+        is_anomaly = False
+        if len(current_buffer) == ROLLING_AVERAGE_WINDOW_SIZE and np.std(list(current_buffer)) > 0:
+            std_dev = np.std(list(current_buffer))
+            if abs(value - rolling_avg) > ANOMALY_THRESHOLD_STD_DEV * std_dev:
+                is_anomaly = True
+                print(f"!!! ANOMALY DETECTED for {device_id} - {metric_name}: Value {value:.2f} vs Avg {rolling_avg:.2f} (StdDev {std_dev:.2f})")
+        is_anomaly_flags[f"is_{metric_name.replace('_bpm', '').replace('_percent', '').replace('_celsius', '')}_anomaly"] = is_anomaly
+
+    # --- Transformation Step 2: Derived Metrics (e.g., Activity Level) ---
+    steps = raw_biometric_data['steps_count']
+    if steps > 200:
+        activity_level = 'active'
+    elif steps > 50:
+        activity_level = 'moderate'
+    elif steps > 0:
+        activity_level = 'light'
+    else:
+        activity_level = 'sedentary'
+    derived_metrics['activity_level'] = activity_level
+
+    # --- Load: Write to Database ---
+    try:
+        with SessionLocal() as db:
+            biometric_entry = BiometricRecord(
+                device_id=device_id,
+                timestamp=timestamp,
+                heart_rate_bpm=raw_biometric_data['heart_rate_bpm'],
+                spo2_percent=raw_biometric_data['spo2_percent'],
+                skin_temperature_celsius=raw_biometric_data['skin_temperature_celsius'],
+                steps_count=raw_biometric_data['steps_count'],
+                heart_rate_rolling_avg=derived_metrics['heart_rate_rolling_avg'],
+                spo2_rolling_avg=derived_metrics['spo2_rolling_avg'],
+                temp_rolling_avg=derived_metrics['temp_rolling_avg'],
+                is_hr_anomaly=is_anomaly_flags['is_heart_rate_bpm_anomaly'],
+                is_spo2_anomaly=is_anomaly_flags['is_spo2_percent_anomaly'],
+                is_temp_anomaly=is_anomaly_flags['is_skin_temperature_celsius_anomaly'],
+                activity_level=derived_metrics['activity_level']
+            )
+            db.add(biometric_entry)
+            db.commit()
+            # print(f"Loaded data for {device_id} at {timestamp.strftime('%H:%M:%S')}")
+    except IntegrityError as e:
+        db.rollback()
+        print(f"Database error (possible duplicate or constraint violation): {e}")
+    except Exception as e:
+        db.rollback()
+        print(f"Error loading biometric data to DB: {e}")
+
+    # --- Alternative Loading Options (Comments) ---
+    # For InfluxDB:
+    # from influxdb_client import InfluxDBClient, Point
+    # from influxdb_client.client.write_api import SYNCHRONOUS
+    # client = InfluxDBClient(url="http://localhost:8086", token="YOUR_TOKEN", org="your_org")
+    # write_api = client.write_api(write_options=SYNCHRONOUS)
+    # point = (
+    #     Point("biometrics")
+    #     .tag("device_id", device_id)
+    #     .field("heart_rate_bpm", raw_biometric_data['heart_rate_bpm'])
+    #     .field("heart_rate_rolling_avg", derived_metrics['heart_rate_rolling_avg'])
+    #     .field("is_hr_anomaly", is_anomaly_flags['is_heart_rate_bpm_anomaly'])
+    #     # ... add other fields
+    #     .time(timestamp)
+    # )
+    # write_api.write(bucket="your_bucket", org="your_org", record=point)
+
+    # For DynamoDB:
+    # import boto3
+    # dynamodb = boto3.resource('dynamodb', region_name='your_region')
+    # table = dynamodb.Table('your_table_name') # Table must be pre-created
+    # item = {
+    #     'device_id': device_id,
+    #     'timestamp': timestamp.isoformat(),
+    #     'heart_rate_bpm': raw_biometric_data['heart_rate_bpm'],
+    #     # ... add all other raw and derived metrics
+    # }
+    # table.put_item(Item=item)
+
+
+# --- Visualization ---
+def visualize_health_trends(db_session_factory):
+    """
+    Fetches historical biometric data from the database and visualizes trends and anomalies.
+    """
+    print("\n--- Generating Health Trend Visualizations ---")
+
+    with db_session_factory() as db:
+        # Fetch all biometric records
+        historical_records = db.query(BiometricRecord).all()
+        if not historical_records:
+            print("No historical biometric data found for visualization.")
+            return
+
+        df_health = pd.DataFrame([{
+            'device_id': rec.device_id,
+            'timestamp': rec.timestamp,
+            'heart_rate_bpm': rec.heart_rate_bpm,
+            'heart_rate_rolling_avg': rec.heart_rate_rolling_avg,
+            'is_hr_anomaly': rec.is_hr_anomaly,
+            'spo2_percent': rec.spo2_percent,
+            'spo2_rolling_avg': rec.spo2_rolling_avg,
+            'is_spo2_anomaly': rec.is_spo2_anomaly,
+            'skin_temperature_celsius': rec.skin_temperature_celsius,
+            'temp_rolling_avg': rec.temp_rolling_avg,
+            'is_temp_anomaly': rec.is_temp_anomaly,
+            'steps_count': rec.steps_count,
+            'activity_level': rec.activity_level
+        } for rec in historical_records])
+
+    if df_health.empty:
+        print("No data to visualize.")
+        return
+
+    df_health['timestamp'] = pd.to_datetime(df_health['timestamp'])
+    df_health.set_index('timestamp', inplace=True)
+
+    # Plot 1: Heart Rate Trends with Anomalies
+    plt.figure(figsize=(15, 8))
+    for device_id in df_health['device_id'].unique():
+        device_df = df_health[df_health['device_id'] == device_id].sort_index()
+        plt.plot(device_df.index, device_df['heart_rate_bpm'], label=f'{device_id} HR (Raw)', alpha=0.7)
+        plt.plot(device_df.index, device_df['heart_rate_rolling_avg'], label=f'{device_id} HR (Avg)', linestyle='--', color='grey', alpha=0.8)
+        anomalies = device_df[device_df['is_hr_anomaly']]
+        if not anomalies.empty:
+            plt.scatter(anomalies.index, anomalies['heart_rate_bpm'], color='red', s=100, marker='X', label=f'{device_id} HR Anomaly')
+
+    plt.title('Heart Rate Trends and Anomalies Over Time')
+    plt.xlabel('Timestamp (UTC)')
+    plt.ylabel('Heart Rate (BPM)')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.xticks(rotation=45, ha='right')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: SpO2 Trends with Anomalies
+    plt.figure(figsize=(15, 8))
+    for device_id in df_health['device_id'].unique():
+        device_df = df_health[df_health['device_id'] == device_id].sort_index()
+        plt.plot(device_df.index, device_df['spo2_percent'], label=f'{device_id} SpO2 (Raw)', alpha=0.7, color='tab:blue')
+        plt.plot(device_df.index, device_df['spo2_rolling_avg'], label=f'{device_id} SpO2 (Avg)', linestyle='--', color='grey', alpha=0.8)
+        anomalies = device_df[device_df['is_spo2_anomaly']]
+        if not anomalies.empty:
+            plt.scatter(anomalies.index, anomalies['spo2_percent'], color='red', s=100, marker='X', label=f'{device_id} SpO2 Anomaly')
+
+    plt.title('SpO2 Trends and Anomalies Over Time')
+    plt.xlabel('Timestamp (UTC)')
+    plt.ylabel('SpO2 (%)')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.xticks(rotation=45, ha='right')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 3: Activity Level Distribution
+    plt.figure(figsize=(8, 6))
+    sns.countplot(x='activity_level', hue='device_id', data=df_health, palette='viridis')
+    plt.title('Distribution of Activity Levels by Device')
+    plt.xlabel('Activity Level')
+    plt.ylabel('Count of Intervals')
+    plt.tight_layout()
+    plt.show()
+
+    print("Health trend visualizations generated.")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    print("--- Running Health Monitoring Pipeline for Wearables ---")
+    print(f"Simulating {NUM_DEVICES} devices sending data every {SIMULATION_INTERVAL_SECONDS} second(s).")
+    print(f"Rolling average window: {ROLLING_AVERAGE_WINDOW_SIZE} data points.")
+    print(f"Anomaly threshold: {ANOMALY_THRESHOLD_STD_DEV} standard deviations.")
+
+    # Start sensor data simulators in separate threads
+    simulator_threads = []
+    for i in range(NUM_DEVICES):
+        device_id = f"wearable_{str(uuid.uuid4())[:8]}"
+        thread = threading.Thread(target=simulate_wearable_data, args=(device_id, SIMULATION_INTERVAL_SECONDS))
+        thread.daemon = True # Daemon threads exit when the main program exits
+        simulator_threads.append(thread)
+        thread.start()
+
+    print("\nHealth Monitoring Pipeline is running. Data is being generated, processed, and stored.")
+    print(f"Data stored in '{DATABASE_URL.split('///')[-1]}'.")
+    print("Press Ctrl+C to stop the simulation and generate final visualizations.")
+
+    try:
+        # Keep the main thread alive to allow simulator threads to run
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping simulation and generating final report...")
+    finally:
+        # Generate final visualizations based on all collected data
+        visualize_health_trends(SessionLocal)
+        print("Pipeline stopped gracefully.")
+
